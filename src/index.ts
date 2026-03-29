@@ -22,12 +22,27 @@ interface MSSQLConfig {
   port?: number;
 }
 
+// Remove SQL comments and normalize whitespace for safe analysis
+function stripComments(query: string): string {
+  // Remove block comments (/* ... */), including nested
+  let result = query.replace(/\/\*[\s\S]*?\*\//g, " ");
+  // Remove line comments (-- ...)
+  result = result.replace(/--[^\n]*/g, " ");
+  // Collapse whitespace
+  return result.replace(/\s+/g, " ").trim();
+}
+
 // Validate that query is read-only
 function isReadOnlyQuery(query: string): boolean {
-  const normalizedQuery = query.trim().toUpperCase();
+  const cleaned = stripComments(query).toUpperCase();
 
-  // Block any query that contains write operations
-  const writeOperations = [
+  // Block multiple statements (semicolons)
+  if (cleaned.includes(";")) {
+    return false;
+  }
+
+  // Dangerous keywords — block if they appear as whole words anywhere
+  const blockedKeywords = [
     'INSERT',
     'UPDATE',
     'DELETE',
@@ -40,25 +55,35 @@ function isReadOnlyQuery(query: string): boolean {
     'MERGE',
     'GRANT',
     'REVOKE',
-    'DENY'
+    'DENY',
+    'BULK',
+    'OPENROWSET',
+    'OPENDATASOURCE',
+    'OPENQUERY',
+    'XP_CMDSHELL',
+    'SP_EXECUTESQL',
+    'SP_CONFIGURE',
+    'RECONFIGURE',
+    'SHUTDOWN',
+    'DBCC',
+    'BACKUP',
+    'RESTORE',
+    'INTO',        // SELECT INTO creates tables
+    'WRITETEXT',
+    'UPDATETEXT',
   ];
 
-  // Check if query starts with write operations or contains them in suspicious contexts
-  for (const op of writeOperations) {
-    // Check at the start of query
-    if (normalizedQuery.startsWith(op)) {
+  for (const keyword of blockedKeywords) {
+    // Match as whole word using word boundary check
+    const regex = new RegExp(`\\b${keyword}\\b`);
+    if (regex.test(cleaned)) {
       return false;
     }
+  }
 
-    // Check after semicolons (multiple statements)
-    if (normalizedQuery.includes(`;${op}`) || normalizedQuery.includes(`; ${op}`)) {
-      return false;
-    }
-
-    // Check in common SQL injection patterns
-    if (normalizedQuery.includes(`--${op}`) || normalizedQuery.includes(`/*${op}`)) {
-      return false;
-    }
+  // Only allow queries that start with SELECT or WITH (CTEs)
+  if (!cleaned.startsWith("SELECT") && !cleaned.startsWith("WITH")) {
+    return false;
   }
 
   return true;
