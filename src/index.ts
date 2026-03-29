@@ -158,6 +158,68 @@ const TOOLS: Tool[] = [
       required: ["table_name"],
     },
   },
+  {
+    name: "list_views",
+    description: "List all views in the current database",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "list_stored_procedures",
+    description: "List all stored procedures in the current database with their schemas",
+    inputSchema: {
+      type: "object",
+      properties: {
+        schema: {
+          type: "string",
+          description: "Filter by schema name (optional)",
+        },
+      },
+    },
+  },
+  {
+    name: "get_foreign_keys",
+    description: "Get foreign key relationships for a specific table, or all tables if no table name is provided",
+    inputSchema: {
+      type: "object",
+      properties: {
+        table_name: {
+          type: "string",
+          description: "The name of the table (optional, shows all if omitted)",
+        },
+      },
+    },
+  },
+  {
+    name: "get_indexes",
+    description: "Get index information for a specific table",
+    inputSchema: {
+      type: "object",
+      properties: {
+        table_name: {
+          type: "string",
+          description: "The name of the table",
+        },
+      },
+      required: ["table_name"],
+    },
+  },
+  {
+    name: "search_columns",
+    description: "Search for columns by name across all tables in the database",
+    inputSchema: {
+      type: "object",
+      properties: {
+        column_name: {
+          type: "string",
+          description: "The column name or pattern to search for (supports SQL LIKE wildcards: % and _)",
+        },
+      },
+      required: ["column_name"],
+    },
+  },
 ];
 
 // Get database configuration from environment variables
@@ -285,6 +347,179 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await db
           .request()
           .input("tableName", sql.VarChar, tableName)
+          .query(query);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: formatResults(result.recordset),
+            },
+          ],
+        };
+      }
+
+      case "list_views": {
+        const query = `
+          SELECT
+            TABLE_SCHEMA,
+            TABLE_NAME
+          FROM INFORMATION_SCHEMA.VIEWS
+          ORDER BY TABLE_SCHEMA, TABLE_NAME
+        `;
+
+        const result = await db.request().query(query);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: formatResults(result.recordset),
+            },
+          ],
+        };
+      }
+
+      case "list_stored_procedures": {
+        const schema = args.schema as string | undefined;
+
+        let query = `
+          SELECT
+            ROUTINE_SCHEMA,
+            ROUTINE_NAME,
+            CREATED,
+            LAST_ALTERED
+          FROM INFORMATION_SCHEMA.ROUTINES
+          WHERE ROUTINE_TYPE = 'PROCEDURE'
+        `;
+
+        const req = db.request();
+
+        if (schema) {
+          query += ` AND ROUTINE_SCHEMA = @schema`;
+          req.input("schema", sql.VarChar, schema);
+        }
+
+        query += ` ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME`;
+
+        const result = await req.query(query);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: formatResults(result.recordset),
+            },
+          ],
+        };
+      }
+
+      case "get_foreign_keys": {
+        const fkTable = args.table_name as string | undefined;
+
+        let query = `
+          SELECT
+            fk.name AS FK_NAME,
+            tp.name AS PARENT_TABLE,
+            cp.name AS PARENT_COLUMN,
+            tr.name AS REFERENCED_TABLE,
+            cr.name AS REFERENCED_COLUMN
+          FROM sys.foreign_keys AS fk
+          INNER JOIN sys.foreign_key_columns AS fkc
+            ON fk.object_id = fkc.constraint_object_id
+          INNER JOIN sys.tables AS tp
+            ON fkc.parent_object_id = tp.object_id
+          INNER JOIN sys.columns AS cp
+            ON fkc.parent_object_id = cp.object_id AND fkc.parent_column_id = cp.column_id
+          INNER JOIN sys.tables AS tr
+            ON fkc.referenced_object_id = tr.object_id
+          INNER JOIN sys.columns AS cr
+            ON fkc.referenced_object_id = cr.object_id AND fkc.referenced_column_id = cr.column_id
+        `;
+
+        const req = db.request();
+
+        if (fkTable) {
+          query += ` WHERE tp.name = @tableName OR tr.name = @tableName`;
+          req.input("tableName", sql.VarChar, fkTable);
+        }
+
+        query += ` ORDER BY tp.name, fk.name`;
+
+        const result = await req.query(query);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: formatResults(result.recordset),
+            },
+          ],
+        };
+      }
+
+      case "get_indexes": {
+        const idxTable = args.table_name as string;
+
+        if (!idxTable) {
+          throw new Error("table_name is required");
+        }
+
+        const query = `
+          SELECT
+            i.name AS INDEX_NAME,
+            i.type_desc AS INDEX_TYPE,
+            i.is_unique AS IS_UNIQUE,
+            i.is_primary_key AS IS_PRIMARY_KEY,
+            STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS COLUMNS
+          FROM sys.indexes AS i
+          INNER JOIN sys.index_columns AS ic
+            ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+          INNER JOIN sys.columns AS c
+            ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+          WHERE i.object_id = OBJECT_ID(@tableName)
+            AND i.name IS NOT NULL
+          GROUP BY i.name, i.type_desc, i.is_unique, i.is_primary_key
+          ORDER BY i.is_primary_key DESC, i.name
+        `;
+
+        const result = await db
+          .request()
+          .input("tableName", sql.VarChar, idxTable)
+          .query(query);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: formatResults(result.recordset),
+            },
+          ],
+        };
+      }
+
+      case "search_columns": {
+        const columnName = args.column_name as string;
+
+        if (!columnName) {
+          throw new Error("column_name is required");
+        }
+
+        const query = `
+          SELECT
+            TABLE_SCHEMA,
+            TABLE_NAME,
+            COLUMN_NAME,
+            DATA_TYPE,
+            IS_NULLABLE
+          FROM INFORMATION_SCHEMA.COLUMNS
+          WHERE COLUMN_NAME LIKE @columnName
+          ORDER BY TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME
+        `;
+
+        const result = await db
+          .request()
+          .input("columnName", sql.VarChar, columnName)
           .query(query);
 
         return {
