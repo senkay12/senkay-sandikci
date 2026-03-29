@@ -9,6 +9,10 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import sql from "mssql";
 
+// Defaults
+const DEFAULT_MAX_ROWS = 1000;
+const DEFAULT_QUERY_TIMEOUT_MS = 30000;
+
 // MSSQL connection configuration
 interface MSSQLConfig {
   user: string;
@@ -20,6 +24,7 @@ interface MSSQLConfig {
     trustServerCertificate: boolean;
   };
   port?: number;
+  requestTimeout?: number;
 }
 
 // Remove SQL comments and normalize whitespace for safe analysis
@@ -115,13 +120,17 @@ const server = new Server(
 const TOOLS: Tool[] = [
   {
     name: "query_mssql",
-    description: "Execute a read-only SQL query on the MSSQL database. Only SELECT queries are allowed. INSERT, UPDATE, DELETE, and other write operations are blocked.",
+    description: "Execute a read-only SQL query on the MSSQL database. Only SELECT queries are allowed. INSERT, UPDATE, DELETE, and other write operations are blocked. Results are limited to max_rows (default 1000). Query timeout is 30 seconds.",
     inputSchema: {
       type: "object",
       properties: {
         query: {
           type: "string",
           description: "The SQL query to execute (read-only)",
+        },
+        max_rows: {
+          type: "number",
+          description: "Maximum number of rows to return (default: 1000)",
         },
       },
       required: ["query"],
@@ -159,6 +168,9 @@ function getConfig(): MSSQLConfig {
     server: process.env.MSSQL_SERVER || "localhost",
     database: process.env.MSSQL_DATABASE || "master",
     port: process.env.MSSQL_PORT ? parseInt(process.env.MSSQL_PORT) : 1433,
+    requestTimeout: process.env.MSSQL_QUERY_TIMEOUT
+      ? parseInt(process.env.MSSQL_QUERY_TIMEOUT)
+      : DEFAULT_QUERY_TIMEOUT_MS,
     options: {
       encrypt: process.env.MSSQL_ENCRYPT === "true",
       trustServerCertificate: process.env.MSSQL_TRUST_CERT !== "false",
@@ -193,6 +205,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "query_mssql": {
         const query = args.query as string;
+        const maxRows = Math.min(
+          Math.max(1, Number(args.max_rows) || DEFAULT_MAX_ROWS),
+          DEFAULT_MAX_ROWS
+        );
 
         if (!query) {
           throw new Error("Query is required");
@@ -205,13 +221,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           );
         }
 
-        const result = await db.request().query(query);
+        // Wrap in a row-limited subquery to prevent unbounded results
+        const limitedQuery = `SELECT TOP(${maxRows}) * FROM (${query}) AS __limited`;
+        const result = await db.request().query(limitedQuery);
+
+        const truncated = result.recordset.length >= maxRows;
+        const summary = truncated
+          ? `\n\n--- Results truncated to ${maxRows} rows. Use max_rows parameter or add TOP/WHERE to your query. ---`
+          : "";
 
         return {
           content: [
             {
               type: "text",
-              text: formatResults(result.recordset),
+              text: formatResults(result.recordset) + summary,
             },
           ],
         };
