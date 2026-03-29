@@ -141,6 +141,18 @@ function getConfig(): MSSQLConfig {
   };
 }
 
+// Shared connection pool
+let pool: sql.ConnectionPool | null = null;
+
+async function getPool(): Promise<sql.ConnectionPool> {
+  if (pool && pool.connected) {
+    return pool;
+  }
+  const config = getConfig();
+  pool = await sql.connect(config);
+  return pool;
+}
+
 // Handle list tools request
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return { tools: TOOLS };
@@ -148,11 +160,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
 // Handle tool execution
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name, arguments: args = {} } = request.params;
 
   try {
-    const config = getConfig();
-    const pool = await sql.connect(config);
+    const db = await getPool();
 
     switch (name) {
       case "query_mssql": {
@@ -169,8 +180,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           );
         }
 
-        const result = await pool.request().query(query);
-        await pool.close();
+        const result = await db.request().query(query);
 
         return {
           content: [
@@ -193,8 +203,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ORDER BY TABLE_SCHEMA, TABLE_NAME
         `;
 
-        const result = await pool.request().query(query);
-        await pool.close();
+        const result = await db.request().query(query);
 
         return {
           content: [
@@ -225,12 +234,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ORDER BY ORDINAL_POSITION
         `;
 
-        const result = await pool
+        const result = await db
           .request()
           .input("tableName", sql.VarChar, tableName)
           .query(query);
-
-        await pool.close();
 
         return {
           content: [
@@ -258,6 +265,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 });
+
+// Graceful shutdown
+async function shutdown() {
+  if (pool) {
+    await pool.close();
+    pool = null;
+  }
+  process.exit(0);
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
 
 // Start the server
 async function main() {
